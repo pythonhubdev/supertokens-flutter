@@ -1,22 +1,23 @@
 import 'dart:convert';
 import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
-import 'package:mutex/mutex.dart';
 import 'package:supertokens_flutter/src/anti-csrf.dart';
 import 'package:supertokens_flutter/src/cookie-store.dart';
 import 'package:supertokens_flutter/src/front-token.dart';
+import 'package:supertokens_flutter/src/logger.dart';
 import 'package:supertokens_flutter/src/utilities.dart';
 import 'package:supertokens_flutter/src/version.dart';
 import 'package:supertokens_flutter/supertokens.dart';
-import 'package:supertokens_flutter/src/logger.dart';
+import 'package:synchronized/synchronized.dart';
 
 import 'constants.dart';
 
 /// An [http.BaseClient] implementation for using SuperTokens for your network requests.
 /// To make use of supertokens, use this as the client for making network calls instead of [http.Client] or your own custom clients.
 /// If you use a custom client for your network calls pass an instance of it as a parameter when initialising [Client], pass [http.Client()] to use the default.
-ReadWriteMutex _refreshAPILock = ReadWriteMutex();
+Lock _refreshAPILock = Lock();
 
 class CustomRequest {
   http.BaseRequest request;
@@ -33,7 +34,6 @@ class Client extends http.BaseClient {
   }
 
   http.Client _innerClient = http.Client();
-  http.BaseRequest? _requestForRetry;
   static SuperTokensCookieStore? cookieStore;
 
   // This annotation will result in a warning to anyone using this method outside of this package
@@ -62,7 +62,8 @@ class Client extends http.BaseClient {
 
     if (SuperTokensUtils.getApiDomain(customRequest.request.url.toString()) !=
         SuperTokens.config.apiDomain) {
-      logDebugMessage('Client._sendWithRetry: Not matching api domain, using inner client');
+      logDebugMessage(
+          'Client._sendWithRetry: Not matching api domain, using inner client');
       return _innerClient.send(customRequest.request);
     }
 
@@ -81,12 +82,12 @@ class Client extends http.BaseClient {
     }
 
     while (true) {
-      await _refreshAPILock.acquireRead();
-      // http package does not allow retries with the same request object, so we clone the request when making the network call
-      http.BaseRequest copiedRequest;
-      LocalSessionState preRequestLocalSessionState;
-      http.StreamedResponse response;
-      try {
+      late http.BaseRequest copiedRequest;
+      late LocalSessionState preRequestLocalSessionState;
+      late http.StreamedResponse response;
+
+      await _refreshAPILock.synchronized(() async {
+        // http package does not allow retries with the same request object, so we clone the request when making the network call
         logDebugMessage('Client._sendWithRetry: Copying request to use it');
         copiedRequest = SuperTokensUtils.copyRequest(customRequest.request);
         copiedRequest =
@@ -97,15 +98,15 @@ class Client extends http.BaseClient {
             preRequestLocalSessionState.lastAccessTokenUpdate);
 
         if (antiCSRFToken != null) {
-          logDebugMessage('Client._sendWithRetry: antiCSRFtoken found, setting it');
+          logDebugMessage(
+              'Client._sendWithRetry: antiCSRFtoken found, setting it');
           copiedRequest.headers[antiCSRFHeaderKey] = antiCSRFToken;
         }
 
         SuperTokensTokenTransferMethod tokenTransferMethod =
             SuperTokens.config.tokenTransferMethod;
         logDebugMessage('Client._sendWithRetry: Setting st-auth-mode');
-        copiedRequest.headers["st-auth-mode"] =
-            tokenTransferMethod.getValue();
+        copiedRequest.headers["st-auth-mode"] = tokenTransferMethod.getValue();
 
         // Adding Authorization headers
         logDebugMessage('Client._sendWithRetry: Adding authorization headers');
@@ -120,11 +121,13 @@ class Client extends http.BaseClient {
 
         // If the request already has a "cookie" header, combine it with persistent cookies
         if (existingCookieHeader != null && existingCookieHeader != "") {
-          logDebugMessage('Client._sendWithRetry: Combining cookies with existing ones');
+          logDebugMessage(
+              'Client._sendWithRetry: Combining cookies with existing ones');
           copiedRequest.headers[HttpHeaders.cookieHeader] =
               _generateCookieHeader(existingCookieHeader, newCookiesToAdd);
         } else {
-          logDebugMessage('Client._sendWithRetry: Adding new cookies: ${newCookiesToAdd}');
+          logDebugMessage(
+              'Client._sendWithRetry: Adding new cookies: ${newCookiesToAdd}');
           copiedRequest.headers[HttpHeaders.cookieHeader] =
               newCookiesToAdd ?? "";
         }
@@ -141,14 +144,13 @@ class Client extends http.BaseClient {
         );
 
         // Save cookies from the response
-        logDebugMessage('Client._sendWithRetry: Saving cookies from the response');
+        logDebugMessage(
+            'Client._sendWithRetry: Saving cookies from the response');
         String? setCookieFromResponse =
             response.headers[HttpHeaders.setCookieHeader];
-        await Client.cookieStore?.saveFromSetCookieHeader(
-            copiedRequest.url, setCookieFromResponse);
-      } finally {
-        _refreshAPILock.release();
-      }
+        await Client.cookieStore
+            ?.saveFromSetCookieHeader(copiedRequest.url, setCookieFromResponse);
+      });
 
       if (response.statusCode == SuperTokens.sessionExpiryStatusCode) {
         /**
@@ -158,12 +160,14 @@ class Client extends http.BaseClient {
           */
         if (customRequest.sessionRefreshAttempts >=
             SuperTokens.config.maxRetryAttemptsForSessionRefresh) {
-          logDebugMessage('Client._sendWithRetry: Max attempts of ${SuperTokens.config.maxRetryAttemptsForSessionRefresh} reached for refreshing, cannot continue');
+          logDebugMessage(
+              'Client._sendWithRetry: Max attempts of ${SuperTokens.config.maxRetryAttemptsForSessionRefresh} reached for refreshing, cannot continue');
           throw SuperTokensException(
               "Received a 401 response from ${customRequest.request.url}. Attempted to refresh the session and retry the request with the updated session tokens ${SuperTokens.config.maxRetryAttemptsForSessionRefresh} times, but each attempt resulted in a 401 error. The maximum session refresh limit has been reached. Please investigate your API. To increase the session refresh attempts, update maxRetryAttemptsForSessionRefresh in the config.");
         }
         customRequest.sessionRefreshAttempts++;
-        logDebugMessage('Client._sendWithRetry: Refreshing attempt: ${customRequest.sessionRefreshAttempts}');
+        logDebugMessage(
+            'Client._sendWithRetry: Refreshing attempt: ${customRequest.sessionRefreshAttempts}');
 
         customRequest.request =
             await _removeAuthHeaderIfMatchesLocalToken(copiedRequest);
@@ -172,7 +176,8 @@ class Client extends http.BaseClient {
             await onUnauthorisedResponse(preRequestLocalSessionState);
         if (shouldRetry.status == UnauthorisedStatus.RETRY) {
           // Here we use the original request because it wont contain any of the modifications we make
-          logDebugMessage('Client._sendWithRetry: Got RETRY status, retrying...');
+          logDebugMessage(
+              'Client._sendWithRetry: Got RETRY status, retrying...');
           return await _sendWithRetry(customRequest);
         } else {
           if (shouldRetry.exception != null) {
@@ -201,7 +206,8 @@ class Client extends http.BaseClient {
       if (accessToken != null &&
           refreshToken != null &&
           authValue == "Bearer $accessToken") {
-        logDebugMessage('Client._removeAuthHeaderIfMatchesLocalToken: Removing authorization headers');
+        logDebugMessage(
+            'Client._removeAuthHeaderIfMatchesLocalToken: Removing authorization headers');
         mutableRequest.headers.remove("Authorization");
         mutableRequest.headers.remove("authorization");
       }
@@ -211,121 +217,128 @@ class Client extends http.BaseClient {
 
   static Future<UnauthorisedResponse> onUnauthorisedResponse(
       LocalSessionState preRequestLocalSessionState) async {
-    try {
-      await _refreshAPILock.acquireWrite();
-
-      LocalSessionState postLockLocalSessionState =
-          await SuperTokensUtils.getLocalSessionState();
-      if (postLockLocalSessionState.status ==
-          LocalSessionStateStatus.NOT_EXISTS) {
-        logDebugMessage('Client.onUnauthorisedResponse: local session state does not exist, throwing unauthorised error');
-        SuperTokens.config.eventHandler(Eventype.UNAUTHORISED);
-        return UnauthorisedResponse(status: UnauthorisedStatus.SESSION_EXPIRED);
-      }
-      if (postLockLocalSessionState.status !=
-              preRequestLocalSessionState.status ||
-          (postLockLocalSessionState.status == LocalSessionStateStatus.EXISTS &&
-              preRequestLocalSessionState.status ==
-                  LocalSessionStateStatus.EXISTS &&
-              postLockLocalSessionState.lastAccessTokenUpdate !=
-                  preRequestLocalSessionState.lastAccessTokenUpdate)) {
-        logDebugMessage('Client.onUnauthorisedResponse: Retry required, throwing retry error');
-        return UnauthorisedResponse(status: UnauthorisedStatus.RETRY);
-      }
-      Uri refreshUrl = Uri.parse(SuperTokens.refreshTokenUrl);
-      http.Request refreshReq = http.Request('POST', refreshUrl);
-      refreshReq = await Utils.setAuthorizationHeaderIfRequiredForRequestObject(
-          refreshReq,
-          addRefreshToken: true);
-
-      if (preRequestLocalSessionState.status ==
-          LocalSessionStateStatus.EXISTS) {
-        logDebugMessage('Client.onUnauthorisedResponse: preRequestLocalSessionState exists');
-        String? antiCSRFToken = await AntiCSRF.getToken(
-            preRequestLocalSessionState.lastAccessTokenUpdate);
-        if (antiCSRFToken != null) {
-          logDebugMessage('Client.onUnauthorisedResponse: Setting antiCSRF token');
-          refreshReq.headers[antiCSRFHeaderKey] = antiCSRFToken;
+    return await _refreshAPILock.synchronized(() async {
+      try {
+        LocalSessionState postLockLocalSessionState =
+            await SuperTokensUtils.getLocalSessionState();
+        if (postLockLocalSessionState.status ==
+            LocalSessionStateStatus.NOT_EXISTS) {
+          logDebugMessage(
+              'Client.onUnauthorisedResponse: local session state does not exist, throwing unauthorised error');
+          SuperTokens.config.eventHandler(Eventype.UNAUTHORISED);
+          return UnauthorisedResponse(
+              status: UnauthorisedStatus.SESSION_EXPIRED);
         }
-      }
+        if (postLockLocalSessionState.status !=
+                preRequestLocalSessionState.status ||
+            (postLockLocalSessionState.status ==
+                    LocalSessionStateStatus.EXISTS &&
+                preRequestLocalSessionState.status ==
+                    LocalSessionStateStatus.EXISTS &&
+                postLockLocalSessionState.lastAccessTokenUpdate !=
+                    preRequestLocalSessionState.lastAccessTokenUpdate)) {
+          logDebugMessage(
+              'Client.onUnauthorisedResponse: Retry required, throwing retry error');
+          return UnauthorisedResponse(status: UnauthorisedStatus.RETRY);
+        }
+        Uri refreshUrl = Uri.parse(SuperTokens.refreshTokenUrl);
+        http.Request refreshReq = http.Request('POST', refreshUrl);
+        refreshReq =
+            await Utils.setAuthorizationHeaderIfRequiredForRequestObject(
+                refreshReq,
+                addRefreshToken: true);
 
-      logDebugMessage('Client.onUnauthorisedResponse: Setting rid and fdi-version headers');
-      refreshReq.headers['rid'] = SuperTokens.rid;
-      refreshReq.headers['fdi-version'] = Version.supported_fdi.join(',');
-      // Add cookies to request headers
-      logDebugMessage('Client.onUnauthorisedResponse: Adding cookies to headers');
-      String? newCookiesToAdd =
-          await Client.cookieStore?.getCookieHeaderStringForRequest(refreshUrl);
-      refreshReq.headers[HttpHeaders.cookieHeader] = newCookiesToAdd ?? "";
-      SuperTokensTokenTransferMethod tokenTransferMethod =
-          SuperTokens.config.tokenTransferMethod;
-      logDebugMessage('Client.onUnauthorisedResponse: Setting st-auth-mode');
-      refreshReq.headers
-          .addAll({'st-auth-mode': tokenTransferMethod.getValue()});
-      refreshReq =
-          SuperTokens.config.preAPIHook(APIAction.REFRESH_TOKEN, refreshReq);
-      var resp = await refreshReq.send();
-      await Utils.saveTokenFromHeaders(resp);
-      http.Response response = await http.Response.fromStream(resp);
+        if (preRequestLocalSessionState.status ==
+            LocalSessionStateStatus.EXISTS) {
+          logDebugMessage(
+              'Client.onUnauthorisedResponse: preRequestLocalSessionState exists');
+          String? antiCSRFToken = await AntiCSRF.getToken(
+              preRequestLocalSessionState.lastAccessTokenUpdate);
+          if (antiCSRFToken != null) {
+            logDebugMessage(
+                'Client.onUnauthorisedResponse: Setting antiCSRF token');
+            refreshReq.headers[antiCSRFHeaderKey] = antiCSRFToken;
+          }
+        }
 
-      // Save cookies from the response
-      String? setCookieFromResponse =
-          response.headers[HttpHeaders.setCookieHeader];
-      await Client.cookieStore
-          ?.saveFromSetCookieHeader(refreshReq.url, setCookieFromResponse);
+        logDebugMessage(
+            'Client.onUnauthorisedResponse: Setting rid and fdi-version headers');
+        refreshReq.headers['rid'] = SuperTokens.rid;
+        refreshReq.headers['fdi-version'] = Version.supported_fdi.join(',');
+        // Add cookies to request headers
+        logDebugMessage(
+            'Client.onUnauthorisedResponse: Adding cookies to headers');
+        String? newCookiesToAdd = await Client.cookieStore
+            ?.getCookieHeaderStringForRequest(refreshUrl);
+        refreshReq.headers[HttpHeaders.cookieHeader] = newCookiesToAdd ?? "";
+        SuperTokensTokenTransferMethod tokenTransferMethod =
+            SuperTokens.config.tokenTransferMethod;
+        logDebugMessage('Client.onUnauthorisedResponse: Setting st-auth-mode');
+        refreshReq.headers
+            .addAll({'st-auth-mode': tokenTransferMethod.getValue()});
+        refreshReq =
+            SuperTokens.config.preAPIHook(APIAction.REFRESH_TOKEN, refreshReq);
+        var resp = await refreshReq.send();
+        await Utils.saveTokenFromHeaders(resp);
+        http.Response response = await http.Response.fromStream(resp);
 
-      bool isUnauthorised =
-          response.statusCode == SuperTokens.config.sessionExpiredStatusCode;
-      logDebugMessage('Client.onUnauthorisedResponse: isUnauthorised: ${isUnauthorised}');
+        // Save cookies from the response
+        String? setCookieFromResponse =
+            response.headers[HttpHeaders.setCookieHeader];
+        await Client.cookieStore
+            ?.saveFromSetCookieHeader(refreshReq.url, setCookieFromResponse);
 
-      String? frontTokenInHeaders = response.headers[frontTokenHeaderKey];
-      if (isUnauthorised && frontTokenInHeaders == null) {
-        logDebugMessage('Client.onUnauthorisedResponse: Removing frontToken by setting remove');
-        await FrontToken.setItem("remove");
-      }
+        bool isUnauthorised =
+            response.statusCode == SuperTokens.config.sessionExpiredStatusCode;
+        logDebugMessage(
+            'Client.onUnauthorisedResponse: isUnauthorised: ${isUnauthorised}');
 
-      SuperTokensUtils.fireSessionUpdateEventsIfNecessary(
-        wasLoggedIn: preRequestLocalSessionState.status ==
-            LocalSessionStateStatus.EXISTS,
-        status: response.statusCode,
-        frontTokenFromResponse: frontTokenInHeaders,
-      );
+        String? frontTokenInHeaders = response.headers[frontTokenHeaderKey];
+        if (isUnauthorised && frontTokenInHeaders == null) {
+          logDebugMessage(
+              'Client.onUnauthorisedResponse: Removing frontToken by setting remove');
+          await FrontToken.setItem("remove");
+        }
 
-      if (response.statusCode >= 300) {
+        SuperTokensUtils.fireSessionUpdateEventsIfNecessary(
+          wasLoggedIn: preRequestLocalSessionState.status ==
+              LocalSessionStateStatus.EXISTS,
+          status: response.statusCode,
+          frontTokenFromResponse: frontTokenInHeaders,
+        );
+
+        if (response.statusCode >= 300) {
+          return UnauthorisedResponse(
+              status: UnauthorisedStatus.API_ERROR,
+              error: SuperTokensException(
+                  "Refresh API returned with status code: ${response.statusCode}"));
+        }
+
+        SuperTokens.config
+            .postAPIHook(APIAction.REFRESH_TOKEN, refreshReq, response);
+
+        if ((await SuperTokensUtils.getLocalSessionState()).status ==
+            LocalSessionStateStatus.NOT_EXISTS) {
+          // The execution should never come here.. but just in case.
+          // removed by server. So we logout
+          // we do not send "UNAUTHORISED" event here because
+          // this is a result of the refresh API returning a session expiry, which
+          // means that the frontend did not know for sure that the session existed
+          // in the first place.
+          logDebugMessage(
+              'Client.onUnauthorisedResponse: local session state does not exist');
+          return UnauthorisedResponse(
+              status: UnauthorisedStatus.SESSION_EXPIRED);
+        }
+
+        SuperTokens.config.eventHandler(Eventype.REFRESH_SESSION);
+        return UnauthorisedResponse(status: UnauthorisedStatus.RETRY);
+      } catch (e) {
         return UnauthorisedResponse(
             status: UnauthorisedStatus.API_ERROR,
-            error: SuperTokensException(
-                "Refresh API returned with status code: ${response.statusCode}"));
+            error: SuperTokensException("Some unknown error occured"));
       }
-
-      SuperTokens.config
-          .postAPIHook(APIAction.REFRESH_TOKEN, refreshReq, response);
-
-      if ((await SuperTokensUtils.getLocalSessionState()).status ==
-          LocalSessionStateStatus.NOT_EXISTS) {
-        // The execution should never come here.. but just in case.
-        // removed by server. So we logout
-        // we do not send "UNAUTHORISED" event here because
-        // this is a result of the refresh API returning a session expiry, which
-        // means that the frontend did not know for sure that the session existed
-        // in the first place.
-        logDebugMessage('Client.onUnauthorisedResponse: local session state does not exist');
-        return UnauthorisedResponse(status: UnauthorisedStatus.SESSION_EXPIRED);
-      }
-
-      SuperTokens.config.eventHandler(Eventype.REFRESH_SESSION);
-      return UnauthorisedResponse(status: UnauthorisedStatus.RETRY);
-    } catch (e) {
-      return UnauthorisedResponse(
-          status: UnauthorisedStatus.API_ERROR,
-          error: SuperTokensException("Some unknown error occured"));
-    } finally {
-      _refreshAPILock.release();
-    }
-  }
-
-  static String _cookieMapToHeaderString(Map<String, dynamic> cookieMap) {
-    return cookieMap.keys.map((e) => "$e=${cookieMap[e]}").join(";");
+    });
   }
 
   static String _generateCookieHeader(String oldCookie, String? newCookie) {
@@ -338,8 +351,10 @@ class Client extends http.BaseClient {
     List<Cookie> newCookies =
         SuperTokensCookieStore.getCookieListFromHeader(newCookie);
     Iterable newCookiesNames = newCookies.map((e) => e.name);
-    logDebugMessage('Client._generateCookieHeader: oldCookies found: ${oldCookies.length}');
-    logDebugMessage('Client._generateCookieHeader: newCookies found: ${newCookies.length}');
+    logDebugMessage(
+        'Client._generateCookieHeader: oldCookies found: ${oldCookies.length}');
+    logDebugMessage(
+        'Client._generateCookieHeader: newCookies found: ${newCookies.length}');
     oldCookies.removeWhere((element) => newCookiesNames.contains(element.name));
     newCookies.addAll(oldCookies);
     return newCookies.map((e) => e.toString()).join(';');
